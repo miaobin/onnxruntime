@@ -174,6 +174,46 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
     Node& fused_node = fused_node_and_graph.fused_node;
     const onnxruntime::GraphViewer& graph_viewer(fused_node_and_graph.filtered_graph);
 
+    // Log subgraph inputs and outputs to help debug dim_param / shape issues.
+    {
+      const auto& logger = *GetLogger();
+      LOGS(logger, INFO) << "[WebNN] Compiling subgraph: " << fused_node.Name();
+
+      const auto log_node_args = [&](const char* label,
+                                     const std::vector<const NodeArg*>& defs) {
+        LOGS(logger, INFO) << "[WebNN]   " << label << " (" << defs.size() << "):";
+        for (size_t i = 0; i < defs.size(); ++i) {
+          const auto* def = defs[i];
+          if (!def) {
+            LOGS(logger, INFO) << "[WebNN]     [" << i << "] <null>";
+            continue;
+          }
+          std::string shape_str;
+          if (const auto* sp = def->Shape()) {
+            shape_str = "[";
+            for (int d = 0; d < sp->dim_size(); ++d) {
+              if (d > 0) shape_str += ", ";
+              const auto& dim = sp->dim(d);
+              if (dim.has_dim_value()) {
+                shape_str += std::to_string(dim.dim_value());
+              } else if (!dim.dim_param().empty()) {
+                shape_str += "?" + dim.dim_param();
+              } else {
+                shape_str += "?";
+              }
+            }
+            shape_str += "]";
+          } else {
+            shape_str = "<no shape>";
+          }
+          LOGS(logger, INFO) << "[WebNN]     [" << i << "] " << def->Name() << "  shape=" << shape_str;
+        }
+      };
+
+      log_node_args("inputs",  graph_viewer.GetInputs());
+      log_node_args("outputs", graph_viewer.GetOutputs());
+    }
+
     webnn::ModelBuilder builder(graph_viewer, *GetLogger(), wnn_context_, wnn_device_type_, wnn_limits_,
                   free_dimension_bounds_);
     std::unique_ptr<webnn::Model> model;

@@ -113,14 +113,58 @@ inline Status ApplyRotaryEmbedding(
       "concat", split_partial_input0.call<emscripten::val>("reverse"), split_axis, concat_partial_input0_options);
 
   emscripten::val gather_position_ids = position_ids;
+
+  // Helper: create an identity range [0, 1, ..., N-1] whose length is the given
+  // dynamic dim (from input's shape).  Used to normalize position_ids' dynamic
+  // dims to match input's dims via identity gather, which is a semantic no-op but
+  // transfers the DynamicDimension identity so that subsequent ops (reshape, mul)
+  // see the same dim objects on both operands.
+  const bool is_int64_supported = model_builder.IsInt64Supported();
+  emscripten::val value_one_constant = is_int64_supported
+                       ? model_builder.CreateOrGetConstant<int64_t>(
+                           ONNX_NAMESPACE::TensorProto_DataType_INT64, static_cast<int64_t>(1), {1})
+                       : model_builder.CreateOrGetConstant<int32_t>(
+                           ONNX_NAMESPACE::TensorProto_DataType_INT32, static_cast<int32_t>(1), {1});
+  auto create_identity_range = [&](emscripten::val dim_size,
+                                   const std::string& label_suffix) -> emscripten::val {
+    emscripten::val range_shape = emscripten::val::array();
+    range_shape.call<void>("push", dim_size);
+    emscripten::val ones = wnn_builder.call<emscripten::val>("expand", value_one_constant, range_shape);
+    emscripten::val cs_opts = emscripten::val::object();
+    cs_opts.set("label", node_name + "_rotary_identity_range_" + label_suffix);
+    cs_opts.set("exclusive", false);
+    cs_opts.set("reversed", false);
+    emscripten::val range_result = wnn_builder.call<emscripten::val>(
+        "cumulativeSum", ones, gsl::narrow<uint32_t>(0), cs_opts);
+    return wnn_builder.call<emscripten::val>("sub", range_result, value_one_constant);
+  };
+
+  // When position_ids is provided, its dynamic dims (batch, seq) may differ from
+  // input's dims due to subgraph boundary creating anonymous dim names.  WebNN's
+  // mul requires matching DynamicDimension objects for broadcasting.
+  // Normalize position_ids' dims to match input's by identity-gathering each axis.
+  if (has_position_ids) {
+    // Axis 0 (batch): gather(position_ids, [0..B-1], axis=0) → output batch = input batch.
+    emscripten::val batch_range = create_identity_range(input["shape"][0], "batch");
+    emscripten::val rebatch_opts = emscripten::val::object();
+    rebatch_opts.set("axis", 0);
+    rebatch_opts.set("label", node_name + "_rotary_rebatch_pos_ids");
+    position_ids = wnn_builder.call<emscripten::val>(
+        "gather", position_ids, batch_range, rebatch_opts);
+
+    if (!position_ids_is_offset) {
+      // Axis 1 (seq): gather(position_ids, [0..S-1], axis=1) → output seq = input seq.
+      emscripten::val seq_range = create_identity_range(input["shape"][1], "seq");
+      emscripten::val reseq_opts = emscripten::val::object();
+      reseq_opts.set("axis", 1);
+      reseq_opts.set("label", node_name + "_rotary_reseq_pos_ids");
+      position_ids = wnn_builder.call<emscripten::val>(
+          "gather", position_ids, seq_range, reseq_opts);
+    }
+    gather_position_ids = position_ids;
+  }
+
   if (position_ids_is_offset) {
-    // Generate a sequence [0, 1, ..., sequence_length-1] with dynamic sequence_length and add the offset.
-    const bool is_int64_supported = model_builder.IsInt64Supported();
-    emscripten::val value_one_constant = is_int64_supported
-                         ? model_builder.CreateOrGetConstant<int64_t>(
-                             ONNX_NAMESPACE::TensorProto_DataType_INT64, static_cast<int64_t>(1), {1})
-                         : model_builder.CreateOrGetConstant<int32_t>(
-                             ONNX_NAMESPACE::TensorProto_DataType_INT32, static_cast<int32_t>(1), {1});
 
     emscripten::val position_ids_range_1d_shape = emscripten::val::array();
     position_ids_range_1d_shape.call<void>("push", input["shape"][1]);
@@ -166,12 +210,7 @@ inline Status ApplyRotaryEmbedding(
     // When position_ids is not provided, gather the first sequence_length rows using a dynamic range.
     // cos_cache/sin_cache shape: [max_sequence_length, half_rotary_embedding_dim]
     // After gather: [sequence_length, half_rotary_embedding_dim]
-    const bool is_int64_supported = model_builder.IsInt64Supported();
-    emscripten::val value_one_constant = is_int64_supported
-                         ? model_builder.CreateOrGetConstant<int64_t>(
-                             ONNX_NAMESPACE::TensorProto_DataType_INT64, static_cast<int64_t>(1), {1})
-                         : model_builder.CreateOrGetConstant<int32_t>(
-                             ONNX_NAMESPACE::TensorProto_DataType_INT32, static_cast<int32_t>(1), {1});
+    // (value_one_constant and is_int64_supported already declared above)
 
     emscripten::val position_ids_range_1d_shape = emscripten::val::array();
     position_ids_range_1d_shape.call<void>("push", input["shape"][1]);
@@ -197,11 +236,29 @@ inline Status ApplyRotaryEmbedding(
     gather_sin = wnn_builder.call<emscripten::val>("gather", gather_sin, position_ids_range, gather_sin_options);
   }
 
-  // Reshape and broadcast them to match the number of heads of the input data.
+  // Reshape gather_cos/sin for broadcasting with partial_input0 [B, S, H, 2, half_rotary].
+  //
+  // gather_cos shape depends on has_position_ids:
+  //   false -> gather used 1D indices [S]   -> gather_cos is 2D [S, half_rotary]
+  //   true  -> gather used 2D indices [B,S] -> gather_cos is 3D [B, S, half_rotary]
+  //
+  // Chromium's reshape rule: every dynamic dim in the output must appear in the
+  // input exactly once (matched by name+minSize+maxSize, then erased).  Using
+  // gather_cos's own shape dims as the leading axes guarantees no duplicate names
+  // and that all output dynamic dims are present in the reshape input.
+  // When gather_cos is 2D we insert a static 1 for the batch axis so it
+  // broadcasts freely against any batch size in partial_input0.
   emscripten::val reshaped_cos_sin_shape = emscripten::val::array();
-  reshaped_cos_sin_shape.call<void>("push", input["shape"][0]);
-  reshaped_cos_sin_shape.call<void>("push", input["shape"][1]);
-  reshaped_cos_sin_shape.call<void>("push", 1);
+  if (has_position_ids) {
+    // 3D gather_cos: [batch, seq, half_rotary]
+    reshaped_cos_sin_shape.call<void>("push", gather_cos["shape"][0]);  // batch
+    reshaped_cos_sin_shape.call<void>("push", gather_cos["shape"][1]);  // seq
+  } else {
+    // 2D gather_cos: [seq, half_rotary] — no batch dim, insert static 1.
+    reshaped_cos_sin_shape.call<void>("push", 1);                       // batch: broadcasts freely
+    reshaped_cos_sin_shape.call<void>("push", gather_cos["shape"][0]);  // seq
+  }
+  reshaped_cos_sin_shape.call<void>("push", 1);  // broadcast across num_heads
   if (interleaved) {
     reshaped_cos_sin_shape.call<void>("push", half_rotary_embedding_dim);
     reshaped_cos_sin_shape.call<void>("push", 1);

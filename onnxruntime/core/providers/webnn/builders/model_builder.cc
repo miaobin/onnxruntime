@@ -266,7 +266,8 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
     ORT_RETURN_IF(shape_proto == nullptr,
                   "shape_proto cannot be null for ", input_output_type, ": ", name);
     const auto& shape = shape_proto->dim();
-    for (const auto& dim : shape) {
+    for (int dim_idx = 0; dim_idx < shape.size(); ++dim_idx) {
+      const auto& dim = shape[dim_idx];
       if (dim.has_dim_value()) {
         // Static dimension: use the concrete value.
         int32_t dim_value = SafeInt<int32_t>(dim.dim_value());
@@ -274,19 +275,56 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
       } else {
         // Dynamic dimension: create an object {name, maxSize} for WebNN.
         const auto dim_name = dim.dim_param();
-        const auto it = free_dimension_bounds_.find(dim_name);
-        ORT_RETURN_IF(it == free_dimension_bounds_.end(),
-                      "Missing FreeDimensionBounds for dynamic dimension: ", dim_name,
-                      ". Provide WebNN EP option FreeDimensionBounds entry with maxSize.");
+        LOGS(logger_, VERBOSE) << "[WebNN] RegisterModelInputOutput: " << input_output_type
+                               << " [" << name << "] dim[" << dim_idx << "] is dynamic,"
+                               << " dim_param=\"" << dim_name << "\"";
 
-        const int32_t min_size = it->second.min_size;
-        const int32_t max_size = it->second.max_size;
-        ORT_RETURN_IF(min_size <= 0 || max_size <= 0 || max_size < min_size,
-                      "Invalid FreeDimensionBounds for dynamic dimension: ", dim_name,
-                      ". Require 1 <= minSize <= maxSize.");
+        int32_t min_size = 1;
+        int32_t max_size = 1;
+        std::string webnn_dim_name = dim_name;
+
+        if (dim_name.empty()) {
+          // Anonymous dynamic dimension (no dim_param): this typically comes from a tensor
+          // that crossed a subgraph boundary after Reshape, where shape inference loses the
+          // symbolic dim name. Use the maximum max_size across all registered bounds as a
+          // conservative fallback, and generate a unique WebNN dim name.
+          for (const auto& kv : free_dimension_bounds_) {
+            max_size = std::max(max_size, kv.second.max_size);
+          }
+          webnn_dim_name = name + "_anon_dim_" + std::to_string(dim_idx);
+          LOGS(logger_, WARNING) << "[WebNN] " << input_output_type << " [" << name << "] dim[" << dim_idx << "]"
+                                 << " has no dim_param (anonymous dynamic dim, likely from a subgraph boundary"
+                                 << " after Reshape). Using fallback maxSize=" << max_size
+                                 << " (max of all FreeDimensionBounds), webnn dim name=\"" << webnn_dim_name << "\".";
+        } else {
+          const auto it = free_dimension_bounds_.find(dim_name);
+          if (it == free_dimension_bounds_.end()) {
+            LOGS(logger_, ERROR) << "[WebNN] Missing FreeDimensionBounds entry for "
+                                 << input_output_type << " [" << name << "] dim[" << dim_idx << "],"
+                                 << " dim_param=\"" << dim_name << "\".";
+            if (free_dimension_bounds_.empty()) {
+              LOGS(logger_, ERROR) << "[WebNN]   FreeDimensionBounds is empty (no entries registered).";
+            } else {
+              LOGS(logger_, ERROR) << "[WebNN]   Currently registered FreeDimensionBounds entries:";
+              for (const auto& kv : free_dimension_bounds_) {
+                LOGS(logger_, ERROR) << "[WebNN]     \"" << kv.first << "\""
+                                     << " -> [" << kv.second.min_size << ", " << kv.second.max_size << "]";
+              }
+            }
+            return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
+                                   "Missing FreeDimensionBounds for dynamic dimension: \"", dim_name,
+                                   "\". Provide WebNN EP option FreeDimensionBounds entry with maxSize.");
+          }
+          min_size = it->second.min_size;
+          max_size = it->second.max_size;
+          LOGS(logger_, VERBOSE) << "[WebNN]   -> bound: [" << min_size << ", " << max_size << "]";
+          ORT_RETURN_IF(min_size <= 0 || max_size <= 0 || max_size < min_size,
+                        "Invalid FreeDimensionBounds for dynamic dimension: ", dim_name,
+                        ". Require 1 <= minSize <= maxSize.");
+        }
 
         emscripten::val dim_obj = emscripten::val::object();
-        dim_obj.set("name", emscripten::val(dim_name));
+        dim_obj.set("name", emscripten::val(webnn_dim_name));
         dim_obj.set("minSize", min_size);
         dim_obj.set("maxSize", max_size);
         shape_array.call<void>("push", dim_obj);
