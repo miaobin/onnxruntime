@@ -65,6 +65,15 @@ class ModelBuilder {
 
   std::string GetUniqueName(const std::string& base_name);
 
+  // Dynamic dimension info tracking for Reshape-derived dimensions.
+  void SetOperandDimInfo(const std::string& name, OperandDimInfo&& dim_info);
+  const OperandDimInfo* GetOperandDimInfo(const std::string& name) const;
+  const FreeDimensionBounds& GetFreeDimensionBounds() const { return free_dimension_bounds_; }
+
+  // Build DynamicDimInfo from a NodeArg's ONNX shape proto + FreeDimensionBounds.
+  // Returns true if at least one dynamic dimension was found, populating dim_info.
+  bool BuildDimInfoFromNodeArg(const NodeArg& node_arg, OperandDimInfo& dim_info) const;
+
  private:
   const GraphViewer& graph_viewer_;
   const logging::Logger& logger_;
@@ -88,6 +97,10 @@ class ModelBuilder {
 
   std::unordered_map<std::string, int> initializer_usage_;
   InlinedHashSet<std::string> skipped_inputs_;
+
+  // Maps operand name -> per-axis dynamic dimension info.
+  // Populated for graph inputs (from FreeDimensionBounds) and Reshape outputs (derived dims).
+  InlinedHashMap<std::string, OperandDimInfo> operand_dim_info_map_;
 
   uint32_t name_token_{0};
   InlinedHashSet<std::string> unique_names_;

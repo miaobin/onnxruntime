@@ -21,6 +21,39 @@ Status BaseOpBuilder::AddToModelBuilder(ModelBuilder& model_builder, const Node&
                     model_builder.GetOpSupportLimits(), logger),
       "Unsupported operator ", node.OpType());
   ORT_RETURN_IF_ERROR(AddToModelBuilderImpl(model_builder, node, logger));
+
+  // Auto-propagate dynamic dimension info through shape-preserving operations.
+  // If the first input has dim info and the first output does not yet have dim info,
+  // and the output has the same rank as the input, copy the dim info to the output.
+  // This enables Reshape chains separated by ops like LayerNorm, Add, etc. to work.
+  //
+  // TODO: Current limitations:
+  // - Only propagates from the first input (input_defs[0]). For binary ops like Add(A, B),
+  //   if only B carries dim info, it won't be propagated.
+  // - Only sets dim info on the first output (output_defs[0]). Multi-output ops like
+  //   SkipSimplifiedLayerNormalization may need dim info on additional outputs.
+  // - Does not handle rank-changing ops (Squeeze, Unsqueeze, Flatten, etc.). Those ops
+  //   would need custom dim info logic in their respective op builders.
+  // - Axis-reordering ops (e.g., Transpose) have the same rank but permute axis semantics.
+  //   Blindly copying dim info would assign dynamic dims to wrong axes.
+  const auto& input_defs = node.InputDefs();
+  const auto& output_defs = node.OutputDefs();
+  if (!input_defs.empty() && !output_defs.empty() &&
+      input_defs[0]->Name() != "" && output_defs[0]->Name() != "") {
+    const auto* input_dim_info = model_builder.GetOperandDimInfo(input_defs[0]->Name());
+    if (input_dim_info != nullptr &&
+        model_builder.GetOperandDimInfo(output_defs[0]->Name()) == nullptr) {
+      // Check that the output has the same rank as the input dim info.
+      const auto* output_shape = output_defs[0]->Shape();
+      if (output_shape != nullptr &&
+          static_cast<size_t>(output_shape->dim_size()) == input_dim_info->size()) {
+        // Copy dim info from input to output (shape-preserving op).
+        OperandDimInfo output_dim_info(*input_dim_info);
+        model_builder.SetOperandDimInfo(output_defs[0]->Name(), std::move(output_dim_info));
+      }
+    }
+  }
+
   return Status::OK();
 }
 

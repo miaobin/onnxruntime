@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstring>
+#include <optional>
 #include <core/common/status.h>
 #include "core/common/inlined_containers.h"
 #include <core/graph/basic_types.h>
@@ -33,6 +34,76 @@ struct FreeDimensionBound {
 };
 
 using FreeDimensionBounds = InlinedHashMap<std::string, FreeDimensionBound>;
+
+// Compute the greatest common divisor of two non-negative integers.
+inline int64_t Gcd(int64_t a, int64_t b) {
+  a = std::abs(a);
+  b = std::abs(b);
+  while (b) {
+    a %= b;
+    std::swap(a, b);
+  }
+  return a;
+}
+
+// Tracks dynamic dimension info produced by Reshape ops.
+// For graph inputs, numerator=1, denominator=1, and base_name is the original dim_param.
+// For Reshape-derived dims, numerator/denominator reflects the rational scaling factor.
+// current_dim = base * numerator / denominator.
+// E.g., sequence_length (1/1) -> reshape x8 -> sequence_length_x8 (8/1)
+//     -> reshape /8 -> sequence_length (1/1).
+// Also handles contraction: sequence_length (1/1) -> reshape /8 -> sequence_length_d8 (1/8).
+struct DynamicDimInfo {
+  std::string base_name;  // Original dim_param, e.g. "sequence_length".
+  int32_t numerator;      // Rational scale numerator: current = base * numerator / denominator.
+  int32_t denominator;    // Rational scale denominator (always > 0).
+  int32_t base_min;       // Base dimension's min bound (from FreeDimensionBounds).
+  int32_t base_max;       // Base dimension's max bound (from FreeDimensionBounds).
+
+  int32_t CurrentMin() const {
+    return static_cast<int32_t>(static_cast<int64_t>(base_min) * numerator / denominator);
+  }
+  int32_t CurrentMax() const {
+    return static_cast<int32_t>(static_cast<int64_t>(base_max) * numerator / denominator);
+  }
+
+  // Return the WebNN dynamic dimension name.
+  // 1/1 -> "sequence_length", 8/1 -> "sequence_length_x8", 1/8 -> "sequence_length_d8".
+  std::string DimName() const {
+    if (numerator == 1 && denominator == 1) return base_name;
+    if (denominator == 1) return base_name + "_x" + std::to_string(numerator);
+    if (numerator == 1) return base_name + "_d" + std::to_string(denominator);
+    return base_name + "_x" + std::to_string(numerator) + "d" + std::to_string(denominator);
+  }
+
+  // Simplify the rational number in-place using GCD.
+  void Simplify() {
+    int64_t g = Gcd(numerator, denominator);
+    if (g > 1) {
+      numerator = static_cast<int32_t>(numerator / g);
+      denominator = static_cast<int32_t>(denominator / g);
+    }
+  }
+
+  // Create a simplified DynamicDimInfo from int64_t numerator/denominator,
+  // reducing via GCD before narrowing to int32_t to avoid overflow.
+  static DynamicDimInfo CreateSimplified(const std::string& base_name,
+                                         int64_t num, int64_t den,
+                                         int32_t base_min, int32_t base_max) {
+    int64_t g = Gcd(num, den);
+    if (g > 1) {
+      num /= g;
+      den /= g;
+    }
+    return DynamicDimInfo{base_name,
+                          static_cast<int32_t>(num),
+                          static_cast<int32_t>(den),
+                          base_min, base_max};
+  }
+};
+
+// Per-operand dynamic dimension info: one optional entry per axis.
+using OperandDimInfo = std::vector<std::optional<DynamicDimInfo>>;
 
 enum class WebnnDeviceType {
   CPU,

@@ -246,6 +246,35 @@ Status ModelBuilder::RegisterInitializers() {
   return Status::OK();
 }
 
+void ModelBuilder::SetOperandDimInfo(const std::string& name, OperandDimInfo&& dim_info) {
+  operand_dim_info_map_[name] = std::move(dim_info);
+}
+
+const OperandDimInfo* ModelBuilder::GetOperandDimInfo(const std::string& name) const {
+  auto it = operand_dim_info_map_.find(name);
+  return it != operand_dim_info_map_.end() ? &it->second : nullptr;
+}
+
+bool ModelBuilder::BuildDimInfoFromNodeArg(const NodeArg& node_arg, OperandDimInfo& dim_info) const {
+  const auto* shape_proto = node_arg.Shape();
+  if (shape_proto == nullptr) return false;
+
+  dim_info.assign(shape_proto->dim_size(), std::nullopt);
+  bool has_dynamic = false;
+  for (int i = 0; i < shape_proto->dim_size(); ++i) {
+    const auto& dim = shape_proto->dim(i);
+    if (!dim.has_dim_value() && !dim.dim_param().empty()) {
+      auto it = free_dimension_bounds_.find(dim.dim_param());
+      if (it != free_dimension_bounds_.end()) {
+        dim_info[i] = DynamicDimInfo{dim.dim_param(), 1, 1,
+                                     it->second.min_size, it->second.max_size};
+        has_dynamic = true;
+      }
+    }
+  }
+  return has_dynamic;
+}
+
 Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_input) {
   const auto& name = node_arg.Name();
   const std::string input_output_type = is_input ? "input" : "output";
@@ -365,6 +394,12 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
     wnn_operands_.insert(std::make_pair(name, wnn_input));
     emscripten::val::module_property("webnnRegisterGraphInput")(name);
     input_names_.push_back(name);
+
+    // Build per-axis DynamicDimInfo for this input's dynamic dimensions.
+    OperandDimInfo dim_info;
+    if (BuildDimInfoFromNodeArg(node_arg, dim_info)) {
+      SetOperandDimInfo(name, std::move(dim_info));
+    }
   } else {
     if (cast_required) {
       cast_required_output_names_.push_back(name);
